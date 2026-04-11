@@ -1,0 +1,12 @@
+# Project root gitignore
+node_modules/
+dist/
+build/
+.env
+*.db
+__pycache__/
+.pytest_cache/
+.vscode/
+.DS_Store
+uploads/
+*.log
