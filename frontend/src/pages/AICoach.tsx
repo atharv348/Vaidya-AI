@@ -6,9 +6,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { MessageCircle, Send, User, Bot, Loader2, Sparkles, HeartPulse, Info, HelpCircle, Mic, Paperclip, Trash2, Square, Copy, RotateCw, Volume2, Globe, Target, Flame, Calendar, Star } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import api from '../services/api';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import heroBg from '@/assets/hero-bg.jpg';
+import { PlanOutputRenderer } from '@/components/ai/PlanOutputRenderer';
 
 interface Message {
   id?: number;
@@ -19,6 +18,11 @@ interface Message {
 
 interface UserProfile {
   full_name: string;
+  age?: number;
+  gender?: string;
+  current_weight?: number;
+  fitness_level?: string;
+  dietary_restrictions?: string | string[];
   fitness_goal: string;
   streak_count: number;
   last_checkin: string;
@@ -332,54 +336,27 @@ export default function AICoach() {
 
           {messages.map((m, i) => (
             <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
-              <div className={`flex gap-4 max-w-[85%] ${m.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                <div className={`w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm ${m.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-card text-primary border border-border/40'}`}>
-                  {m.role === 'user' ? <User size={18} /> : <Bot size={18} />}
-                </div>
-                <div className={`p-4 rounded-2xl text-sm leading-relaxed shadow-md ${
-                  m.role === 'user' 
-                  ? 'bg-gradient-to-br from-primary to-primary/80 text-primary-foreground rounded-tr-none' 
-                  : 'bg-card text-foreground rounded-tl-none border border-border/40'
-                }`}>
-                  <div className={`prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed prose-pre:bg-muted prose-pre:border prose-pre:border-border/40 prose-table:border prose-table:border-border/40 prose-th:bg-muted/50 prose-th:p-2 prose-td:p-2 ${
-                    m.role === 'user' ? 'prose-strong:text-white prose-p:text-white' : 'prose-strong:text-primary'
-                  }`}>
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                      {m.content}
-                    </ReactMarkdown>
+              {m.role === 'user' ? (
+                <div className="flex gap-4 max-w-[85%] flex-row-reverse">
+                  <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm bg-primary text-primary-foreground">
+                    <User size={18} />
                   </div>
-                  {m.role === 'assistant' && (
-                    <div className="mt-4 flex flex-col gap-3">
-                      <div className="flex items-center gap-2 border-t border-border/40 pt-3">
-                        <Button size="sm" variant="ghost" onClick={() => copyText(m.content)} className="h-7 px-2 text-xs"><Copy className="w-3.5 h-3.5 mr-1" />Copy</Button>
-                        <Button size="sm" variant="ghost" onClick={() => speakText(m.content)} className="h-7 px-2 text-xs"><Volume2 className="w-3.5 h-3.5 mr-1" />Speak</Button>
-                        {i === messages.length - 1 && (
-                          <Button size="sm" variant="ghost" onClick={regenerateLast} className="h-7 px-2 text-xs"><RotateCw className="w-3.5 h-3.5 mr-1" />Regenerate</Button>
-                        )}
-                      </div>
-                      
-                      {m.id && (
-                        <div className="flex items-center gap-2 pt-1">
-                          <span className="text-[10px] font-bold text-muted-foreground uppercase">Rate Session:</span>
-                          <div className="flex items-center">
-                            {[1, 2, 3, 4, 5].map((star) => (
-                              <button
-                                key={star}
-                                onClick={() => handleRate(m.id!, star)}
-                                className={`p-1 transition-colors ${
-                                  (m.rating || 0) >= star ? 'text-yellow-400' : 'text-muted-foreground/30 hover:text-yellow-200'
-                                }`}
-                              >
-                                <Star size={14} fill={(m.rating || 0) >= star ? "currentColor" : "none"} />
-                              </button>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <div className="p-4 rounded-2xl text-sm leading-relaxed shadow-md bg-gradient-to-br from-primary to-primary/80 text-primary-foreground rounded-tr-none">
+                    {m.content}
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <div className="flex gap-4 max-w-[95%]">
+                  <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm bg-card text-primary border border-border/40">
+                    <Bot size={18} />
+                  </div>
+                  <PlanOutputRenderer
+                    content={m.content}
+                    userProfile={userProfile}
+                    onRegenerate={i === messages.length - 1 ? regenerateLast : undefined}
+                  />
+                </div>
+              )}
             </div>
           ))}
           {loading && (

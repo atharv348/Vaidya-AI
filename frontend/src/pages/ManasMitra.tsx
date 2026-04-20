@@ -13,6 +13,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
 import { Textarea } from "@/components/ui/textarea";
+import ReactMarkdown from "react-markdown";
 
 const CHECKIN_QUESTIONS = [
   // Domain 1: Sleep
@@ -59,9 +60,12 @@ export default function ManasMitra() {
   const [correlation, setCorrelation] = useState<any>(null);
 
   const [cameraError, setCameraError] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [activeCameraLabel, setActiveCameraLabel] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const activeStreamRef = useRef<MediaStream | null>(null);
   const navigate = useNavigate();
   const { toast } = useToast();
 
@@ -71,9 +75,13 @@ export default function ManasMitra() {
     
     return () => {
       // Cleanup camera on unmount
-      if (videoRef.current && videoRef.current.srcObject) {
-        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+      if (activeStreamRef.current) {
+        const tracks = activeStreamRef.current.getTracks();
         tracks.forEach(track => track.stop());
+        activeStreamRef.current = null;
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
       }
     };
   }, []);
@@ -105,31 +113,218 @@ export default function ManasMitra() {
     }
   };
 
+  const stopStream = (stream: MediaStream | null) => {
+    if (!stream) return;
+    stream.getTracks().forEach(track => track.stop());
+  };
+
+  const waitForVideoMount = async (retries = 24, delayMs = 50): Promise<HTMLVideoElement | null> => {
+    for (let i = 0; i < retries; i++) {
+      if (videoRef.current) {
+        return videoRef.current;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+    }
+    return null;
+  };
+
+  const scoreCameraLabel = (label: string) => {
+    const l = label.toLowerCase();
+    let score = 0;
+
+    if (/integrated|built[- ]?in|internal|laptop|front|webcam|hd camera|facetime/.test(l)) score += 25;
+    if (/usb|uvc/.test(l)) score += 10;
+    if (/infrared|\bir\b/.test(l)) score -= 30;
+    if (/virtual|obs|manycam|snap camera|xsplit|epoccam|droidcam|ip webcam|ndi|camo/.test(l)) score -= 60;
+
+    return score;
+  };
+
+  const getVideoStreamFromConstraints = async (constraintsList: MediaStreamConstraints[]): Promise<MediaStream> => {
+    let lastError: unknown = null;
+    for (const constraints of constraintsList) {
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    throw lastError ?? new Error('Unable to access laptop camera');
+  };
+
+  const bindStreamToVideo = async (stream: MediaStream) => {
+    const video = await waitForVideoMount();
+    if (!video) {
+      throw new Error('Video preview element unavailable');
+    }
+
+    video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
+
+    try {
+      await video.play();
+    } catch {
+      // Some browsers defer play until metadata is ready.
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finalize = () => {
+        if (settled) return;
+        settled = true;
+        setCameraReady(true);
+        resolve();
+      };
+
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        reject(new Error('Camera opened but no visible video frames were received'));
+      };
+
+      const verify = () => {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          finalize();
+        }
+      };
+
+      const timeoutId = window.setTimeout(() => {
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          finalize();
+          return;
+        }
+        fail();
+      }, 2500);
+      const onMetadata = () => {
+        window.clearTimeout(timeoutId);
+        verify();
+      };
+
+      video.addEventListener('loadedmetadata', onMetadata, { once: true });
+      video.addEventListener('loadeddata', onMetadata, { once: true });
+      video.addEventListener('canplay', onMetadata, { once: true });
+      video.addEventListener('playing', onMetadata, { once: true });
+
+      verify();
+    });
+  };
+
+  const requestLaptopCameraStream = async (): Promise<MediaStream> => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error('Camera API not available in this browser context');
+    }
+
+    const seedConstraints: MediaStreamConstraints[] = [
+      {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'user' },
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      },
+      {
+        audio: false,
+        video: { facingMode: { ideal: 'user' } }
+      },
+      {
+        audio: false,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      },
+      { audio: false, video: true }
+    ];
+
+    const seedStream = await getVideoStreamFromConstraints(seedConstraints);
+
+    if (!navigator.mediaDevices.enumerateDevices) {
+      return seedStream;
+    }
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+      const sortedDevices = [...videoDevices].sort((a, b) => scoreCameraLabel(b.label) - scoreCameraLabel(a.label));
+
+      if (!sortedDevices.length || !sortedDevices[0].deviceId) {
+        return seedStream;
+      }
+
+      const targetDevice = sortedDevices[0];
+      const currentDeviceId = seedStream.getVideoTracks()[0]?.getSettings()?.deviceId;
+
+      if (!currentDeviceId || currentDeviceId === targetDevice.deviceId) {
+        return seedStream;
+      }
+
+      try {
+        const preferredStream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            deviceId: { exact: targetDevice.deviceId },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        });
+
+        stopStream(seedStream);
+        return preferredStream;
+      } catch {
+        return seedStream;
+      }
+    } catch {
+      return seedStream;
+    }
+  };
+
   const startCamera = async () => {
     setCameraOpen(true);
     setCameraError(false);
+    setCameraReady(false);
+    setActiveCameraLabel('');
     setDetectedEmotion(null);
     setQuizStep(0);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-      }
+      const stream = await requestLaptopCameraStream();
+      activeStreamRef.current = stream;
+      const cameraLabel = stream.getVideoTracks()[0]?.label || 'Unknown camera';
+      setActiveCameraLabel(cameraLabel);
+      await bindStreamToVideo(stream);
     } catch (err) {
+      stopStream(activeStreamRef.current);
+      activeStreamRef.current = null;
+      setActiveCameraLabel('');
+
+      const domErr = err as DOMException;
+      const permissionBlocked = domErr?.name === 'NotAllowedError' || domErr?.name === 'SecurityError';
+      const noHardware = domErr?.name === 'NotFoundError' || domErr?.name === 'OverconstrainedError';
+
       setCameraError(true);
+      setCameraReady(false);
       toast({
         variant: "destructive",
         title: "Camera Access Restricted",
-        description: "Falling back to simulated sentiment analysis."
+        description: permissionBlocked
+          ? "Allow camera permission in your browser for localhost, then retry."
+          : noHardware
+            ? "No usable laptop camera was found. Check if another app is using it."
+            : "Unable to start laptop camera. Falling back to simulated sentiment analysis."
       });
     }
   };
 
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-      tracks.forEach(track => track.stop());
+    stopStream(activeStreamRef.current);
+    activeStreamRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
     }
+    setActiveCameraLabel('');
+    setCameraReady(false);
     setCameraOpen(false);
     setIsCapturing(false);
   };
@@ -194,6 +389,15 @@ export default function ManasMitra() {
   };
 
   const runFacialInference = async () => {
+    if (!cameraError && (!cameraReady || !videoRef.current || videoRef.current.videoWidth < 10 || videoRef.current.videoHeight < 10)) {
+      toast({
+        variant: "destructive",
+        title: "Camera Not Ready",
+        description: "Please wait for camera preview and keep your face centered, then retry."
+      });
+      return;
+    }
+
     setIsCapturing(true);
     setCaptureProgress(0);
     setDetectedEmotion(null);
@@ -256,6 +460,17 @@ export default function ManasMitra() {
           emotion_vector: avgVector,
           image_b64: imageB64
         }, { timeout: 6000 });
+
+        if (!cameraError && (response.data?.status === 'no_face_detected' || response.data?.face_detected === false)) {
+          toast({
+            variant: "destructive",
+            title: "Face Not Detected",
+            description: response.data?.message || "Please face the camera directly and improve lighting, then try again."
+          });
+          setIsCapturing(false);
+          setCaptureProgress(0);
+          return;
+        }
 
         const dominant = response.data?.dominant ? String(response.data.dominant) : 'neutral';
         const moodLabel = dominant.charAt(0).toUpperCase() + dominant.slice(1);
@@ -502,6 +717,22 @@ export default function ManasMitra() {
             </Card>
 
             <div className="space-y-8">
+              <Card className="border-border/40 shadow-sm bg-emerald-500/5 border-emerald-500/20">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-sm font-bold flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 text-emerald-500" />
+                    Stress Relief Suggestion
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="max-h-[280px] overflow-y-auto pr-1 text-xs text-muted-foreground leading-relaxed [&_p]:mb-2 [&_ul]:ml-4 [&_ul]:list-disc [&_li]:mb-1 [&_strong]:text-foreground">
+                    <ReactMarkdown>
+                      {latest?.recommendation || "Take a short mindful break, hydrate, and do one calming activity today."}
+                    </ReactMarkdown>
+                  </div>
+                </CardContent>
+              </Card>
+
               <Card className="border-border/40 shadow-sm bg-primary/5 border-primary/10">
                 <CardHeader className="pb-2">
                   <CardTitle className="text-sm font-bold flex items-center gap-2">
@@ -640,13 +871,21 @@ export default function ManasMitra() {
                   <h3 className="text-white text-xl font-bold">{detectedEmotion}</h3>
                 </div>
               ) : !cameraError && (
-                <p className="text-white/80 text-sm font-medium">Position your face clearly in the frame</p>
+                <p className="text-white/80 text-sm font-medium">
+                  {cameraReady ? "Position your face clearly in the frame" : "Connecting to laptop camera..."}
+                </p>
               )}
             </div>
             
             <Button variant="ghost" size="icon" className="absolute top-4 right-4 text-white hover:bg-white/20" onClick={stopCamera}>
               <X className="w-6 h-6" />
             </Button>
+
+            {!cameraError && activeCameraLabel && (
+              <div className="absolute bottom-4 left-4 rounded-lg bg-black/50 px-2 py-1 text-[10px] text-white/90 max-w-[80%] truncate">
+                Camera: {activeCameraLabel}
+              </div>
+            )}
           </div>
           <div className="p-6 bg-card space-y-4">
             <div className="flex items-center gap-3">
@@ -656,14 +895,22 @@ export default function ManasMitra() {
               <div>
                 <h3 className="font-bold">Facial Sentiment Analysis</h3>
                 <p className="text-xs text-muted-foreground">
-                  {cameraError ? "Hardware access skipped. Using demo mode." : "Inference runs entirely on-device for your privacy."}
+                  {cameraError
+                    ? "Hardware access skipped. Using demo mode."
+                    : activeCameraLabel
+                      ? `Using ${activeCameraLabel}`
+                      : "Inference runs entirely on-device for your privacy."}
                 </p>
               </div>
             </div>
             {!isCapturing && !detectedEmotion && (
               <div className="flex gap-3">
-                <Button onClick={runFacialInference} className="flex-1 rounded-xl gradient-primary">
-                  {cameraError ? "Simulate Analysis (5s)" : "Start Analysis (5s)"}
+                <Button
+                  onClick={runFacialInference}
+                  disabled={!cameraError && !cameraReady}
+                  className="flex-1 rounded-xl gradient-primary"
+                >
+                  {cameraError ? "Simulate Analysis (5s)" : cameraReady ? "Start Analysis (5s)" : "Connecting Camera..."}
                 </Button>
                 <Button onClick={skipScan} variant="outline" className="flex-1 rounded-xl border-border/40">
                   Skip Scan

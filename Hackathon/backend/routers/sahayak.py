@@ -13,6 +13,7 @@ from .users import get_current_user
 from pydantic import BaseModel
 from services.groq_service import generate_ai_content, get_sahayak_guidance
 from services.scheme_search import get_scheme_search_engine
+from schemas import SahayakProfileUpdate
 
 # Defer OCR dependency import and model initialization to request time.
 ocr_predictor = None
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/sahayak", tags=["sahayak"])
 
 # Schemas
 class DisabilityProfileUpdate(BaseModel):
-    disability_type: Optional[str] = None
+    disability_types: Optional[List[str]] = None
     disability_percentage: Optional[float] = None
     has_udid: Optional[bool] = None
     has_aadhaar: Optional[bool] = None
@@ -65,7 +66,7 @@ class SearchResponse(BaseModel):
 
 @router.post("/profile")
 def update_profile(
-    data: DisabilityProfileUpdate,
+    data: SahayakProfileUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -74,8 +75,14 @@ def update_profile(
         profile = UserDisabilityProfile(user_id=current_user.id)
         db.add(profile)
     
-    for key, value in data.dict(exclude_unset=True).items():
-        setattr(profile, key, value)
+    update_data = data.dict(exclude_unset=True)
+    
+    if "disability_types" in update_data:
+        profile.disability_type = json.dumps(update_data["disability_types"])
+
+    for key, value in update_data.items():
+        if key != "disability_types":
+            setattr(profile, key, value)
     
     db.commit()
     return {"status": "success", "message": "Profile updated"}
@@ -152,7 +159,13 @@ async def scan_document(
     
     # Auto-fill profile fields if found
     if doc_type == "disability_certificate":
-        if "disability_type" in parsed_info: profile.disability_type = parsed_info["disability_type"]
+        if "disability_type" in parsed_info:
+            # If single, wrap in a list. If multiple, it's already a list.
+            dis_types = parsed_info["disability_type"]
+            if isinstance(dis_types, str):
+                profile.disability_type = json.dumps([dis_types])
+            else:
+                profile.disability_type = json.dumps(dis_types)
         if "percentage" in parsed_info: profile.disability_percentage = float(parsed_info["percentage"])
     elif doc_type == "aadhaar":
         profile.has_aadhaar = True
@@ -173,8 +186,15 @@ def get_profile(
         db.add(profile)
         db.commit()
     
+    disability_types = []
+    if profile.disability_type:
+        try:
+            disability_types = json.loads(profile.disability_type)
+        except (json.JSONDecodeError, TypeError):
+            disability_types = [profile.disability_type] # Fallback for old string format
+
     return {
-        "disability_type": profile.disability_type or "",
+        "disability_types": disability_types,
         "disability_percentage": profile.disability_percentage or 0,
         "income_annual": profile.income_annual or 0,
         "state": profile.state or "All"
@@ -192,8 +212,15 @@ def get_scheme_matches(
     if not profile:
         return []
     
+    disability_types = []
+    if profile.disability_type:
+        try:
+            disability_types = json.loads(profile.disability_type)
+        except (json.JSONDecodeError, TypeError):
+            disability_types = [profile.disability_type] # Fallback for old string format
+
     user_profile = {
-        "disability_type": profile.disability_type,
+        "disability_types": disability_types,
         "disability_percentage": profile.disability_percentage,
         "income_annual": profile.income_annual,
         "state": profile.state
@@ -295,8 +322,15 @@ def get_sahayak_ai_guidance(
     if not profile:
         return {"guidance": "Please update your eligibility profile to get personalized guidance."}
     
+    disability_types = []
+    if profile.disability_type:
+        try:
+            disability_types = json.loads(profile.disability_type)
+        except (json.JSONDecodeError, TypeError):
+            disability_types = [profile.disability_type]
+
     user_profile = {
-        "disability_type": profile.disability_type,
+        "disability_types": disability_types,
         "disability_percentage": profile.disability_percentage,
         "income_annual": profile.income_annual,
         "state": profile.state
@@ -328,15 +362,22 @@ async def semantic_search(
         print("Profile not found for Sahayak search")
         raise HTTPException(status_code=404, detail="Profile not found")
 
+    disability_types = []
+    if profile.disability_type:
+        try:
+            disability_types = json.loads(profile.disability_type)
+        except (json.JSONDecodeError, TypeError):
+            disability_types = [profile.disability_type]
+
     user_profile = {
-        "disability_type": profile.disability_type,
+        "disability_types": disability_types,
         "disability_percentage": profile.disability_percentage,
         "income_annual": profile.income_annual,
         "state": profile.state
     }
     print(f"User profile: {user_profile}")
 
-    final_query = f"{question} for a {user_profile['disability_percentage']}% {user_profile['disability_type']} disabled person in {user_profile['state']}"
+    final_query = f"{question} for a {user_profile['disability_percentage']}% {'/'.join(user_profile['disability_types'])} disabled person in {user_profile['state']}"
     
     try:
         results = search_engine.search_schemes(user_profile, question=question)

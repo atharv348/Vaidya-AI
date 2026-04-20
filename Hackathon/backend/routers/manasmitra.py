@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 from datetime import datetime, timezone, timedelta
 import numpy as np
@@ -8,6 +8,7 @@ import cv2
 import base64
 import os
 import tempfile
+import re
 
 # Lazy loading of heavy ML libraries to speed up backend startup
 DEEPFACE_AVAILABLE = None
@@ -37,11 +38,461 @@ def get_detectors():
             
     return DEEPFACE_AVAILABLE, FER_AVAILABLE, detector
   
-from database import get_db, User, StressLog, FacialScan, CheckinResponse, SentimentResult
+from database import get_db, User, StressLog, FacialScan, CheckinResponse, SentimentResult, UserDisabilityProfile
+from services.groq_service import generate_ai_content, get_groq_client
 from .users import get_current_user
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/manasmitra", tags=["manasmitra"])
+
+
+def detect_primary_face(image: np.ndarray):
+    """Return the largest detected face bounding box (x, y, w, h) or None."""
+    if image is None:
+        return None
+
+    try:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        if face_cascade.empty():
+            return None
+
+        min_w = max(48, gray.shape[1] // 10)
+        min_h = max(48, gray.shape[0] // 10)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=4,
+            minSize=(min_w, min_h)
+        )
+        if len(faces) == 0:
+            return None
+
+        # Use the largest face in frame.
+        x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
+        return int(x), int(y), int(w), int(h)
+    except Exception:
+        return None
+
+
+def stress_relief_recommendation(stress_index: float) -> str:
+    if stress_index > 85:
+        return "High burnout risk detected. Pause for 10 minutes now: 4-7-8 breathing for 5 rounds, hydrate, then message AROMI for a recovery plan."
+    if stress_index > 70:
+        return "Stress is high. Take a 5-10 minute walk, reduce notifications for 30 minutes, and do one guided breathing session."
+    if stress_index > 40:
+        return "Moderate stress detected. Try a short break every 50 minutes, neck/shoulder stretches, and one calming activity tonight."
+    return "Stress is in a healthy range. Keep your routine, sleep window, and hydration consistent."
+
+
+CRISIS_RESPONSE = (
+    "I hear you. Please reach out to iCall: 9152987821 "
+    "or your nearest support. You are not alone."
+)
+
+
+MANASMITRA_STRESS_SYSTEM_PROMPT = """
+You are ManasMitra, an empathetic AI mental wellness companion inside VaidyaAI.
+After analyzing a user's stress and mood data, generate a structured, personalized stress relief report.
+
+DATA YOU RECEIVE
+- Domain scores: Sleep %, Mood %, Focus %, Social %, Physical %
+- Stress trend: Rising / Stable / Falling + duration
+- Sleep-Stress correlation score (e.g. r=0.72)
+- Burnout trajectory: Healthy / Warning / Critical
+- Any SahayakAI triggers (e.g. NMHP eligibility)
+
+RULES
+- Always reference these numbers.
+- Never give generic advice.
+- Keep sentence length under 20 words.
+- Use "you" and "your".
+- Never suggest medication or diagnosis.
+- Never use alarmist language.
+
+OUTPUT ORDER (mandatory)
+1. **STRESS SUMMARY** (max 2 sentences)
+2. **WHY YOUR STRESS IS RISING** (3-4 bullets; cause + data evidence)
+3. **WHAT TO DO - RELIEF ACTIONS** (tiered)
+    [Immediate - do today]
+    [This week]
+    [This month]
+4. **WHAT NOT TO DO** (3-4 bullets; "Avoid X because Y")
+5. **WHAT INCREASES YOUR STRESS** (2-3 personalized patterns)
+6. **TOMORROW'S FOCUS** (one micro-goal under 15 words)
+7. **ENCOURAGEMENT LINE** (one sentence)
+
+RESPONSE FORMAT RULES
+- Section headers must be bold and one line each.
+- Bullet points: max 4 per section.
+- Each bullet must include cause + action.
+- Every bullet must start on a new line.
+- Tier labels must each start on a new line.
+- Do not output the literal words "on next line".
+- Do not use tables.
+- Do not repeat advice across sections.
+- Do not open with "Based on your data".
+
+SAFETY RULE
+- If burnout = Critical OR stress trend is rising longer than 3 weeks,
+  include: "Consider speaking to a counselor. SahayakAI can help find support near you."
+- If user mentions self-harm, hopelessness, or crisis, return only:
+  "I hear you. Please reach out to iCall: 9152987821 or your nearest support. You are not alone."
+""".strip()
+
+
+REQUIRED_STRESS_HEADERS = [
+    "**STRESS SUMMARY**",
+    "**WHY YOUR STRESS IS RISING**",
+    "**WHAT TO DO - RELIEF ACTIONS**",
+    "**WHAT NOT TO DO**",
+    "**WHAT INCREASES YOUR STRESS**",
+    "**TOMORROW'S FOCUS**",
+    "**ENCOURAGEMENT LINE**"
+]
+
+
+def _domain_breakdown_from_checkins(checkins: List[CheckinResponse]) -> Dict[str, float]:
+    domains = ["Sleep", "Mood", "Focus", "Social", "Physical"]
+    breakdown: Dict[str, float] = {}
+
+    for domain in domains:
+        values = [c.answer_value for c in checkins if c.domain == domain]
+        if values:
+            breakdown[domain] = float((np.mean(values) / 5.0) * 100.0)
+        else:
+            breakdown[domain] = 40.0
+
+    return breakdown
+
+
+def _aggregate_daily_stress(logs: List[StressLog]) -> List[Tuple[Any, float]]:
+    by_day: Dict[Any, List[float]] = {}
+    for log in logs:
+        day = log.timestamp.date()
+        by_day.setdefault(day, []).append(float(log.stress_index or 0.0))
+
+    return sorted((day, float(np.mean(scores))) for day, scores in by_day.items())
+
+
+def _compute_stress_trend(logs: List[StressLog]) -> Tuple[str, int]:
+    daily = _aggregate_daily_stress(logs)
+    if len(daily) < 3:
+        return "Stable", max(1, len(daily))
+
+    values = np.array([score for _, score in daily], dtype=float)
+    x = np.arange(len(values), dtype=float)
+    slope = float(np.polyfit(x, values, 1)[0])
+
+    if slope > 1.0:
+        direction = "Rising"
+    elif slope < -1.0:
+        direction = "Falling"
+    else:
+        direction = "Stable"
+
+    duration = 1
+    tolerance = 1.0
+    for i in range(len(values) - 1, 0, -1):
+        delta = values[i] - values[i - 1]
+        if direction == "Rising":
+            if delta >= -tolerance:
+                duration += 1
+            else:
+                break
+        elif direction == "Falling":
+            if delta <= tolerance:
+                duration += 1
+            else:
+                break
+        else:
+            if abs(delta) <= 2.5:
+                duration += 1
+            else:
+                break
+
+    return direction, duration
+
+
+def _compute_sleep_stress_correlation(db: Session, user_id: int, lookback_days: int = 21) -> float:
+    start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+
+    sleep_entries = db.query(CheckinResponse).filter(
+        CheckinResponse.user_id == user_id,
+        CheckinResponse.domain == "Sleep",
+        CheckinResponse.created_at >= start
+    ).all()
+
+    recent_logs = db.query(StressLog).filter(
+        StressLog.user_id == user_id,
+        StressLog.timestamp >= start
+    ).order_by(StressLog.timestamp.asc()).all()
+
+    if not sleep_entries or not recent_logs:
+        return 0.72
+
+    sleep_by_day: Dict[Any, List[float]] = {}
+    for entry in sleep_entries:
+        sleep_by_day.setdefault(entry.created_at.date(), []).append(entry.answer_value)
+
+    stress_by_day = dict(_aggregate_daily_stress(recent_logs))
+
+    pairs: List[Tuple[float, float]] = []
+    for day, values in sleep_by_day.items():
+        next_day = day + timedelta(days=1)
+        if next_day not in stress_by_day:
+            continue
+
+        sleep_percent = float((np.mean(values) / 5.0) * 100.0)
+        sleep_deficit = max(0.0, 100.0 - sleep_percent)
+        pairs.append((sleep_deficit, float(stress_by_day[next_day])))
+
+    if len(pairs) < 3:
+        return 0.72
+
+    arr = np.array(pairs, dtype=float)
+    corr = float(np.corrcoef(arr[:, 0], arr[:, 1])[0, 1])
+    if np.isnan(corr):
+        return 0.72
+
+    return round(max(0.0, min(0.99, abs(corr))), 2)
+
+
+def _format_duration(days: int) -> str:
+    if days >= 14:
+        weeks = max(1, round(days / 7))
+        return f"{weeks} weeks"
+    if days == 1:
+        return "1 day"
+    return f"{days} days"
+
+
+def _compute_burnout_trajectory(stress_index: float, trend_label: str, trend_days: int) -> str:
+    if stress_index >= 85 or (trend_label == "Rising" and trend_days > 21):
+        return "Critical"
+    if stress_index >= 70:
+        return "Warning"
+    if trend_label == "Rising" and trend_days >= 7:
+        return "Warning (Rising Slope, 7-Day Alert)"
+    return "Healthy"
+
+
+def _compute_sahayak_trigger(
+    stress_index: float,
+    trend_label: str,
+    trend_days: int,
+    has_disability_profile: bool,
+    masking_pattern: bool
+) -> str:
+    triggers: List[str] = []
+
+    if stress_index >= 45 or (trend_label == "Rising" and trend_days >= 7):
+        triggers.append("NMHP Schemes Found")
+    if has_disability_profile and stress_index >= 70:
+        triggers.append("Caregiver Support Eligibility")
+    if masking_pattern:
+        triggers.append("Masking Pattern Watch")
+
+    return ", ".join(triggers) if triggers else "None"
+
+
+def _has_crisis_signal(checkins: List[CheckinResponse]) -> bool:
+    keywords = [
+        "self-harm", "harm myself", "suicide", "kill myself", "end my life",
+        "want to die", "can't go on", "hopeless", "no reason to live"
+    ]
+
+    for checkin in checkins:
+        free_text = (checkin.free_text or "").strip().lower()
+        if free_text and any(keyword in free_text for keyword in keywords):
+            return True
+
+    return False
+
+
+def _build_stress_report_user_message(
+    domain_scores: Dict[str, float],
+    trend_label: str,
+    trend_days: int,
+    correlation_r: float,
+    burnout_trajectory: str,
+    sahayak_trigger: str
+) -> str:
+    sleep = round(domain_scores.get("Sleep", 40.0))
+    mood = round(domain_scores.get("Mood", 40.0))
+    focus = round(domain_scores.get("Focus", 40.0))
+    social = round(domain_scores.get("Social", 40.0))
+    physical = round(domain_scores.get("Physical", 40.0))
+
+    return (
+        "Analyze my stress data and give me a full report.\n\n"
+        "Today's readings:\n"
+        f"  Sleep: {sleep}% | Mood: {mood}% | Focus: {focus}%\n"
+        f"  Social: {social}% | Physical: {physical}%\n\n"
+        f"Stress trend: {trend_label} for {_format_duration(trend_days)}\n"
+        f"Sleep-Stress correlation: r={correlation_r:.2f}\n"
+        f"Burnout trajectory: {burnout_trajectory}\n"
+        f"SahayakAI trigger: {sahayak_trigger}"
+    )
+
+
+def _fallback_structured_stress_report(
+    stress_index: float,
+    domain_scores: Dict[str, float],
+    trend_label: str,
+    trend_days: int,
+    correlation_r: float,
+    burnout_trajectory: str
+) -> str:
+    sleep = domain_scores.get("Sleep", 40.0)
+    mood = domain_scores.get("Mood", 40.0)
+    focus = domain_scores.get("Focus", 40.0)
+    social = domain_scores.get("Social", 40.0)
+    physical = domain_scores.get("Physical", 40.0)
+
+    sorted_domains = sorted(domain_scores.items(), key=lambda item: item[1])
+    top_drivers = sorted_domains[:3]
+    duration_text = _format_duration(trend_days)
+
+    why_lines: List[str] = []
+    for domain, score in top_drivers:
+        if domain == "Sleep":
+            why_lines.append(
+                f"- Sleep ({score:.0f}%) is low, so use a fixed wind-down to reduce next-day stress spikes."
+            )
+        elif domain == "Focus":
+            why_lines.append(
+                f"- Focus ({score:.0f}%) is strained, so batch deep work into 25-minute blocks with breaks."
+            )
+        elif domain == "Mood":
+            why_lines.append(
+                f"- Mood ({score:.0f}%) is under pressure, so add one calming reset before difficult tasks."
+            )
+        elif domain == "Social":
+            why_lines.append(
+                f"- Social ({score:.0f}%) is reduced, so schedule one supportive conversation this week."
+            )
+        elif domain == "Physical":
+            why_lines.append(
+                f"- Physical ({score:.0f}%) is low, so add light movement to reduce body tension." 
+            )
+
+    while len(why_lines) < 3:
+        why_lines.append(
+            f"- Sleep-stress link is strong (r={correlation_r:.2f}), so protect sleep timing to lower pressure."
+        )
+
+    report = [
+        "**STRESS SUMMARY**",
+        f"Your stress is {trend_label.lower()} for {duration_text}, with a current index of {stress_index:.0f}/100.",
+        f"Sleep {sleep:.0f}% and focus {focus:.0f}% are your biggest pressure points right now.",
+        "",
+        "**WHY YOUR STRESS IS RISING**",
+        *why_lines[:4],
+        "",
+        "**WHAT TO DO - RELIEF ACTIONS**",
+        "[Immediate - do today]",
+        "- Do 4-7-8 breathing for 5 minutes before your next task.",
+        "- Take a 10-minute walk and hydrate once now.",
+        "",
+        "[This week]",
+        "- Keep a fixed screen-off time before sleep on 5 nights.",
+        "- Add two 20-minute focus blocks daily with no notifications.",
+        "",
+        "[This month]",
+        "- Build a weekly recovery routine with one low-stress evening block.",
+        "",
+        "**WHAT NOT TO DO**",
+        "- Avoid late-night scrolling because it worsens your sleep-stress coupling.",
+        "- Avoid skipping meals because low energy amplifies mood and focus strain.",
+        "- Avoid multitasking overload because it pushes focus below stable range.",
+        "",
+        "**WHAT INCREASES YOUR STRESS**",
+        f"- Rising trend over {duration_text} shows cumulative load, not one bad day.",
+        f"- Sleep-stress correlation (r={correlation_r:.2f}) shows sleep deficit predicts next-day pressure.",
+        f"- Burnout trajectory is {burnout_trajectory}, so consistency matters more than intensity.",
+        "",
+        "**TOMORROW'S FOCUS**",
+        "Sleep before 11 PM and do a 10-minute walk.",
+        "",
+        "**ENCOURAGEMENT LINE**",
+        "You are catching this early, and that gives you a real advantage."
+    ]
+
+    return "\n".join(report)
+
+
+def _clean_model_report(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^```(?:markdown|md|text)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    cleaned = "\n".join(
+        re.sub(r"\s+on next line\s*$", "", line, flags=re.IGNORECASE)
+        for line in cleaned.splitlines()
+    ).strip()
+    return cleaned
+
+
+def _validate_report_structure(report: str, fallback_report: str) -> str:
+    lowered = report.lower()
+    positions = [lowered.find(header.lower()) for header in REQUIRED_STRESS_HEADERS]
+    if any(idx < 0 for idx in positions):
+        return fallback_report
+    if positions != sorted(positions):
+        return fallback_report
+    return report
+
+
+def generate_stress_relief_report(
+    *,
+    stress_index: float,
+    domain_scores: Dict[str, float],
+    trend_label: str,
+    trend_days: int,
+    correlation_r: float,
+    burnout_trajectory: str,
+    sahayak_trigger: str,
+    checkins: List[CheckinResponse]
+) -> str:
+    if _has_crisis_signal(checkins):
+        return CRISIS_RESPONSE
+
+    fallback_report = _fallback_structured_stress_report(
+        stress_index=stress_index,
+        domain_scores=domain_scores,
+        trend_label=trend_label,
+        trend_days=trend_days,
+        correlation_r=correlation_r,
+        burnout_trajectory=burnout_trajectory,
+    )
+
+    if get_groq_client() is None:
+        report = fallback_report
+    else:
+        try:
+            user_message = _build_stress_report_user_message(
+                domain_scores=domain_scores,
+                trend_label=trend_label,
+                trend_days=trend_days,
+                correlation_r=correlation_r,
+                burnout_trajectory=burnout_trajectory,
+                sahayak_trigger=sahayak_trigger,
+            )
+            raw_report = generate_ai_content(user_message, MANASMITRA_STRESS_SYSTEM_PROMPT)
+            report = _validate_report_structure(_clean_model_report(raw_report), fallback_report)
+        except Exception:
+            report = fallback_report
+
+    needs_referral = burnout_trajectory.startswith("Critical") or (trend_label == "Rising" and trend_days > 21)
+    if needs_referral and "Consider speaking to a counselor" not in report:
+        report = (
+            report.rstrip()
+            + "\n\nConsider speaking to a counselor. "
+            + "SahayakAI can help find support near you."
+        )
+
+    return report
 
 # Robust post-processing to reduce persistent 'sad' bias under poor lighting
 def stabilize_emotion(dominant: str, emotions: dict, img: np.ndarray | None):
@@ -199,6 +650,7 @@ def ingest_facial_data(
     valence = data.valence
     e = data.emotion_vector
     tmp_path = None
+    face_detected = False
     
     # Lazy load ML models
     DEEPFACE_READY, FER_READY, detector_ready = get_detectors()
@@ -212,10 +664,25 @@ def ingest_facial_data(
             img_bytes = base64.b64decode(encoded)
             nparr_full = np.frombuffer(img_bytes, np.uint8)
             img_full = cv2.imdecode(nparr_full, cv2.IMREAD_COLOR)
+
+            face_bbox = detect_primary_face(img_full)
+            if face_bbox is None:
+                return {
+                    "status": "no_face_detected",
+                    "face_detected": False,
+                    "message": "No clear face detected. Please face the camera directly and improve lighting.",
+                    "model": "opencv-haarcascade"
+                }
+
+            face_detected = True
+            x, y, w, h = face_bbox
+            face_crop = img_full[y:y+h, x:x+w]
+            ok, encoded_face = cv2.imencode(".jpg", face_crop)
+            analysis_bytes = encoded_face.tobytes() if ok else img_bytes
             
             # Use temporary file for DeepFace analysis
             with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp_file:
-                tmp_file.write(img_bytes)
+                tmp_file.write(analysis_bytes)
                 tmp_path = tmp_file.name
 
             # TRY 1: DeepFace (State-of-the-Art, ensemble of datasets)
@@ -248,7 +715,7 @@ def ingest_facial_data(
             if not dominant and FER_READY and detector_ready:
                 try:
                     print("Backend: Falling back to FER analysis...")
-                    nparr = np.frombuffer(img_bytes, np.uint8)
+                    nparr = np.frombuffer(analysis_bytes, np.uint8)
                     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     results = detector_ready.detect_emotions(img)
                     if results:
@@ -307,6 +774,7 @@ def ingest_facial_data(
         "dominant": dominant,
         "valence": valence,
         "facial_stress": valence,
+        "face_detected": face_detected,
         "model": "Kaggle-FER2013-Optimized"
     }
 
@@ -428,29 +896,45 @@ def log_behavior(
     db.add(log)
     db.commit()
     
-    # Category and recommendation
+    # Category
     category = "Low"
-    recommendation = "You're doing great! Keep it up."
-    
     if stress_index > 85:
         category = "Critical"
-        recommendation = "High burnout risk! Please take a break and talk to AROMI."
     elif stress_index > 70:
         category = "High"
-        recommendation = "Stress levels are high. Consider a short walk or deep breathing."
     elif stress_index > 40:
         category = "Medium"
-        recommendation = "You're feeling a bit stressed. Don't forget to take regular breaks."
-        
-    # Masking Pattern detection
-    if facial_score > 70 and subjective_score < 40:
-        recommendation = "You mentioned you're doing well, but I'm noticing some tension in your expression. Would you like to talk about anything?"
-        
-    # Cross-module interaction: check for disability
-    from database import UserDisabilityProfile
+
+    recent_logs = db.query(StressLog).filter(
+        StressLog.user_id == current_user.id,
+        StressLog.timestamp >= thirty_days_ago
+    ).order_by(StressLog.timestamp.asc()).all()
+
+    trend_label, trend_days = _compute_stress_trend(recent_logs)
+    correlation_r = _compute_sleep_stress_correlation(db, current_user.id)
+    masking_pattern = facial_score > 70 and subjective_score < 40
     profile = db.query(UserDisabilityProfile).filter(UserDisabilityProfile.user_id == current_user.id).first()
-    if profile and stress_index > 70:
-        recommendation += " Based on your profile, you might want to explore caregiver support schemes in SahayakAI."
+
+    burnout_trajectory = _compute_burnout_trajectory(stress_index, trend_label, trend_days)
+    sahayak_trigger = _compute_sahayak_trigger(
+        stress_index=stress_index,
+        trend_label=trend_label,
+        trend_days=trend_days,
+        has_disability_profile=bool(profile),
+        masking_pattern=masking_pattern,
+    )
+
+    domain_scores = _domain_breakdown_from_checkins(checkins)
+    recommendation = generate_stress_relief_report(
+        stress_index=stress_index,
+        domain_scores=domain_scores,
+        trend_label=trend_label,
+        trend_days=trend_days,
+        correlation_r=correlation_r,
+        burnout_trajectory=burnout_trajectory,
+        sahayak_trigger=sahayak_trigger,
+        checkins=checkins,
+    )
         
     return {
         "stress_index": stress_index,
@@ -482,12 +966,58 @@ def get_stress_summary(
         CheckinResponse.user_id == current_user.id,
         CheckinResponse.created_at >= today_start
     ).all()
-    
-    domains = ["Sleep", "Mood", "Focus", "Social", "Physical"]
-    breakdown = {}
-    for d in domains:
-        d_checkins = [c for c in checkins if c.domain == d]
-        breakdown[d] = (np.mean([c.answer_value for c in d_checkins]) / 5) * 100 if d_checkins else 40 # Default to 40 for UI
+
+    breakdown = _domain_breakdown_from_checkins(checkins)
+
+    trend_label = "Stable"
+    trend_days = 1
+    correlation_r = 0.72
+    burnout_trajectory = "Healthy"
+    sahayak_trigger = "None"
+    recommendation = "Take a short mindful break, hydrate, and do one calming activity today."
+
+    if latest_log:
+        thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
+        recent_logs = db.query(StressLog).filter(
+            StressLog.user_id == current_user.id,
+            StressLog.timestamp >= thirty_days_ago
+        ).order_by(StressLog.timestamp.asc()).all()
+
+        trend_label, trend_days = _compute_stress_trend(recent_logs)
+        correlation_r = _compute_sleep_stress_correlation(db, current_user.id)
+        masking_pattern = (latest_log.facial_score or 0) > 70 and (latest_log.subjective_score or 0) < 40
+        profile = db.query(UserDisabilityProfile).filter(UserDisabilityProfile.user_id == current_user.id).first()
+
+        burnout_trajectory = _compute_burnout_trajectory(float(latest_log.stress_index), trend_label, trend_days)
+        sahayak_trigger = _compute_sahayak_trigger(
+            stress_index=float(latest_log.stress_index),
+            trend_label=trend_label,
+            trend_days=trend_days,
+            has_disability_profile=bool(profile),
+            masking_pattern=masking_pattern,
+        )
+
+        recommendation = generate_stress_relief_report(
+            stress_index=float(latest_log.stress_index),
+            domain_scores=breakdown,
+            trend_label=trend_label,
+            trend_days=trend_days,
+            correlation_r=correlation_r,
+            burnout_trajectory=burnout_trajectory,
+            sahayak_trigger=sahayak_trigger,
+            checkins=checkins,
+        )
+
+    latest_category = "Low"
+    latest_index = 42.0
+    if latest_log:
+        latest_index = float(latest_log.stress_index)
+        if latest_index > 85:
+            latest_category = "Critical"
+        elif latest_index > 70:
+            latest_category = "High"
+        elif latest_index > 40:
+            latest_category = "Medium"
         
     return {
         "logs": [
@@ -501,9 +1031,13 @@ def get_stress_summary(
             for log in logs
         ],
         "latest": {
-            "stress_index": latest_log.stress_index if latest_log else 42,
-            "category": "Low" if not latest_log else ("Critical" if latest_log.stress_index > 85 else "High" if latest_log.stress_index > 70 else "Medium" if latest_log.stress_index > 40 else "Low"),
-            "recommendation": "You're doing great!" if not latest_log else "Keep an eye on your stress levels."
+            "stress_index": latest_index,
+            "category": latest_category,
+            "recommendation": recommendation,
+            "trend": f"{trend_label} for {_format_duration(trend_days)}",
+            "burnout_trajectory": burnout_trajectory,
+            "sahayak_trigger": sahayak_trigger,
+            "sleep_stress_correlation": correlation_r,
         },
         "breakdown": breakdown
     }
@@ -513,12 +1047,10 @@ def get_correlation(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    # Sleep-Stress correlation logic
-    # Pull sleep scores and next-day stress indices
-    logs = db.query(StressLog).filter(StressLog.user_id == current_user.id).order_by(StressLog.timestamp.desc()).limit(14).all()
-    
-    # Mock correlation for demo
+    correlation_r = _compute_sleep_stress_correlation(db, current_user.id)
+    consistency = int(round(correlation_r * 100))
+
     return {
-        "r": 0.72,
-        "insight": "For you specifically, poor sleep predicts high stress the next day with 72% consistency."
+        "r": correlation_r,
+        "insight": f"For you specifically, poor sleep predicts high stress the next day with {consistency}% consistency."
     }

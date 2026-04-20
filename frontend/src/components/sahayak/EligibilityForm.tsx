@@ -7,9 +7,10 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Checkbox } from "@/components/ui/checkbox";
 import api from "@/services/api";
+import { MultiSelect } from "@/components/ui/multi-select";
 
 export interface EligibilityProfile {
-  disabilityType: string;
+  disabilityTypes: string[];
   disabilityPercentage: number;
   annualIncome: number;
   state: string;
@@ -73,7 +74,7 @@ const DOCUMENTS = [
 
 const EligibilityForm = ({ onSubmit }: EligibilityFormProps) => {
   const [profile, setProfile] = useState<EligibilityProfile>({
-    disabilityType: "",
+    disabilityTypes: [],
     disabilityPercentage: 40,
     annualIncome: 0,
     state: "",
@@ -97,7 +98,7 @@ const EligibilityForm = ({ onSubmit }: EligibilityFormProps) => {
     // Sync with backend profile
     try {
       const backendProfile = {
-        disability_type: profile.disabilityType,
+        disability_types: profile.disabilityTypes,
         disability_percentage: profile.disabilityPercentage,
         income_annual: profile.annualIncome,
         state: profile.state,
@@ -164,16 +165,14 @@ const EligibilityForm = ({ onSubmit }: EligibilityFormProps) => {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
             <div className="space-y-2">
               <Label className="flex items-center gap-2 text-foreground font-medium">
-                <FileText className="w-4 h-4 text-primary" /> Disability Type
+                <FileText className="w-4 h-4 text-primary" /> Disability Types
               </Label>
-              <Select value={profile.disabilityType} onValueChange={(v) => setProfile({ ...profile, disabilityType: v })}>
-                <SelectTrigger><SelectValue placeholder="Select type" /></SelectTrigger>
-                <SelectContent>
-                  {DISABILITY_TYPES.map((t) => (
-                    <SelectItem key={t} value={t}>{t}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <MultiSelect
+                options={DISABILITY_TYPES.map(t => ({ label: t, value: t }))}
+                selected={profile.disabilityTypes}
+                onChange={(selected) => setProfile({ ...profile, disabilityTypes: selected })}
+                placeholder="Select disabilities..."
+              />
             </div>
             <div className="space-y-2">
               <Label className="flex items-center gap-2 text-foreground font-medium">

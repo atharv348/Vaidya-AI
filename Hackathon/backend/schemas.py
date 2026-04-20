@@ -97,6 +97,11 @@ class MealPlanResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class SahayakProfileUpdate(BaseModel):
+    disability_types: Optional[List[str]] = None
+    disability_percentage: Optional[float] = None
+    income_annual: Optional[float] = None
+    state: Optional[str] = None
 
 # Clinical Prediction schemas
 class ClinicalPredictionCreate(BaseModel):

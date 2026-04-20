@@ -128,6 +128,38 @@ const FindHospital: React.FC = () => {
     setLoading(false);
   }, []);
 
+  // Approximate location fallback when browser GPS is unavailable/blocked.
+  const fetchApproxLocation = useCallback(async (): Promise<[number, number] | null> => {
+    const providers = [
+      async () => {
+        const res = await fetch('https://ipapi.co/json/');
+        if (!res.ok) throw new Error('ipapi failed');
+        const data = await res.json();
+        return [Number(data.latitude), Number(data.longitude)] as [number, number];
+      },
+      async () => {
+        const res = await fetch('https://ipwho.is/');
+        if (!res.ok) throw new Error('ipwho failed');
+        const data = await res.json();
+        if (!data?.success) throw new Error('ipwho unsuccessful');
+        return [Number(data.latitude), Number(data.longitude)] as [number, number];
+      },
+    ];
+
+    for (const provider of providers) {
+      try {
+        const [lat, lon] = await provider();
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180) {
+          return [lat, lon];
+        }
+      } catch {
+        // Try the next provider.
+      }
+    }
+
+    return null;
+  }, []);
+
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!searchQuery.trim()) return;
@@ -251,7 +283,30 @@ const FindHospital: React.FC = () => {
         fetchNearbyHospitals(nextLoc);
         setLocating(false);
       },
-      (geoError) => {
+      async (geoError) => {
+        const approxLoc = await fetchApproxLocation();
+        if (approxLoc) {
+          setUserLocation(approxLoc);
+          if (!mapRef.current?.map) {
+            initMap(approxLoc);
+          } else {
+            const { map, L, userMarker, userIcon } = mapRef.current;
+            if (userMarker) {
+              userMarker.setLatLng(approxLoc);
+            } else {
+              mapRef.current.userMarker = L.marker(approxLoc, { icon: userIcon })
+                .addTo(map)
+                .bindPopup('<b>Your location (approximate)</b>');
+            }
+            map.setView(approxLoc, 14, { animate: true });
+          }
+          lastHospitalFetchRef.current = approxLoc;
+          fetchNearbyHospitals(approxLoc);
+          setError('Using approximate location. Enable precise location permission for better results.');
+          setLocating(false);
+          return;
+        }
+
         if (geoError.code === geoError.PERMISSION_DENIED) {
           setError('Location permission denied. Enable location access in browser settings and try again.');
         } else {
@@ -261,7 +316,7 @@ const FindHospital: React.FC = () => {
       },
       { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
-  }, [fetchNearbyHospitals, initMap]);
+  }, [fetchApproxLocation, fetchNearbyHospitals, initMap]);
 
   // ── Add hospital markers once both map + data are ready ──────────────────
   useEffect(() => {
@@ -341,9 +396,20 @@ const FindHospital: React.FC = () => {
       );
     };
 
-    if (!navigator.geolocation) {
-      setError('Geolocation is not supported on this device.');
+    const bootstrapApproxOrFallback = async (fallbackMessage: string) => {
+      const approxLoc = await fetchApproxLocation();
+      if (approxLoc) {
+        setError('Using approximate location. Enable precise location permission for better results.');
+        bootstrap(approxLoc);
+        return;
+      }
+
+      setError(fallbackMessage);
       bootstrap(fallback);
+    };
+
+    if (!navigator.geolocation) {
+      void bootstrapApproxOrFallback('Geolocation is not supported on this device. Showing a default area.');
       return () => {
         if (mapRef.current?.map) {
           mapRef.current.map.remove();
@@ -353,8 +419,7 @@ const FindHospital: React.FC = () => {
     }
 
     if (!window.isSecureContext) {
-      setError('Live location needs HTTPS (or localhost). Showing default area.');
-      bootstrap(fallback);
+      void bootstrapApproxOrFallback('Live location needs HTTPS (or localhost). Showing a default area.');
       return () => {
         if (mapRef.current?.map) {
           mapRef.current.map.remove();
@@ -373,9 +438,17 @@ const FindHospital: React.FC = () => {
         setLocating(false);
         startLiveTracking();
       },
-      (geoError) => {
-        bootstrap(fallback);
+      async (geoError) => {
         setLocating(false);
+
+        const approxLoc = await fetchApproxLocation();
+        if (approxLoc) {
+          bootstrap(approxLoc);
+          setError('Using approximate location. Enable location access for precise nearby hospitals.');
+          return;
+        }
+
+        bootstrap(fallback);
 
         if (geoError.code === geoError.PERMISSION_DENIED) {
           setError('Location permission denied. Enable location access and tap the navigation button to retry.');
@@ -397,7 +470,7 @@ const FindHospital: React.FC = () => {
         mapRef.current = null;
       }
     };
-  }, [fetchNearbyHospitals, initMap]);
+  }, [fetchApproxLocation, fetchNearbyHospitals, initMap]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: '#f8fafc', fontFamily: 'Syne, system-ui, sans-serif' }}>

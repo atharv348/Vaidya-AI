@@ -70,7 +70,7 @@ IMPORTANT: Respond ONLY in the user's preferred language ({current_user.preferre
     )
     db.add(assistant_message)
 
-    # Save to database
+    # Save to database                                    
     meal_plan = MealPlan(
         user_id=current_user.id,
         title=f"Meal Plan - {request.prompt[:50]}...",

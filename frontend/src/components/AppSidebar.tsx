@@ -8,7 +8,6 @@ import {
   MapPin,
   Settings,
   Activity,
-  UtensilsCrossed,
   LogOut,
   Accessibility,
   Zap,
@@ -31,9 +30,8 @@ import {
 
 const mainItems = [
   { title: "Dashboard", url: "/", icon: LayoutDashboard },
-  { title: "AI Coach", url: "/coach", icon: MessageCircle },
+  { title: "AI Hub", url: "/coach", icon: MessageCircle },
   { title: "AI Diagnosis", url: "/diagnosis", icon: Brain },
-  { title: "Plans", url: "/plans", icon: UtensilsCrossed },
 ];
 
 const specializedItems = [

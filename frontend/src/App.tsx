@@ -12,7 +12,6 @@ import RegisterPage from "./pages/RegisterPage.tsx";
 import ForgotPasswordPage from "./pages/ForgotPasswordPage.tsx";
 import AICoach from "./pages/AICoach.tsx";
 import Diagnosis from "./pages/Diagnosis.tsx";
-import PlanStudio from "./pages/PlanStudio.tsx";
 import Achievements from "./pages/Achievements.tsx";
 import FindHospital from "./pages/FindHospital.tsx";
 import ActivityLog from "./pages/ActivityLog.tsx";
@@ -55,9 +54,9 @@ const App = () => (
                           <Route path="/dashboard" element={<Navigate to="/" replace />} />
                           <Route path="/coach" element={<AICoach />} />
                           <Route path="/diagnosis" element={<Diagnosis />} />
-                          <Route path="/plans" element={<PlanStudio />} />
-                          <Route path="/meals" element={<Navigate to="/plans" replace />} />
-                          <Route path="/workouts" element={<Navigate to="/plans" replace />} />
+                          <Route path="/plans" element={<Navigate to="/coach" replace />} />
+                          <Route path="/meals" element={<Navigate to="/coach" replace />} />
+                          <Route path="/workouts" element={<Navigate to="/coach" replace />} />
                           <Route path="/achievements" element={<Achievements />} />
                           <Route path="/hospitals" element={<FindHospital />} />
                           <Route path="/activity" element={<ActivityLog />} />
