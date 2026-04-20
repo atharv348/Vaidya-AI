@@ -54,4 +54,4 @@ VaidyaAI is a sophisticated health-tracking and multi-organ diagnostic applicati
 - **Netlify**: Frontend is optimized for manual or CI/CD deployment via the `dist` folder.
 
 ---
-© 2026 VaidyaAI. Developed for the Pragyantra Hackathon.
+© 2026 VaidyaAI. 
